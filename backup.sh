@@ -3,7 +3,10 @@
 ############# VARS ###############
 BACKUP_DIR="/media/BACKUP/Backup"
 DATE="$(date +"%Y-%m-%d")"
-echo "test: $DATE"
+FREE=0
+EXISTINGFILES=0
+MARGIN=0
+TOTAL_SIZE=0
 
 # Info backup
 DISKS=("/dev/nvme0n1" "/dev/nvme1n1" "/dev/sda") # Use fdisk individually rather than sfdisk to get info of partitionless disks
@@ -19,7 +22,8 @@ BOOT_SIZE= # in bytes
 # Rsync backup - array of arrays
 RSYNC_BACKUP_TARGETS=("Games") # First will be copied to $BACKUP_DIR/$RSYNC_BACKUP_TARGETS[], then backed up to $BACKUP_DIR/$RSYNC_BACKUP_TARGETS[].tar.xz
 RSYNC_SOURCES_0=("/mnt/games/cloneHero" "/mnt/games/links" "/mnt/games/mods")
-RSYNC_SIZES=() # in bytes
+RSYNC_SIZES=() # in bytes - parallel to RSYNC_BACKUP_TARGETS[]
+RSYNC_SIZES_0=() # in bytes - parallel to RSYNC_SOURCES_0[]
 
 # BTRFS backup - parallel arrays
 BTRFS_TARGETS=("Root" "Home" "VMs" "Data" "GameBackups") # will backup to $BTRFS_TARGETS.btrfs.xz
@@ -81,6 +85,8 @@ humanSize() {
   printf "%s%.2f %s\n" "$sign" "$bytes" "${units[$i]}"
 }
 
+############# MAIN #################
+
 # Check if root
 if [ "$EUID" -ne 0 ]; then
   echo "ERROR: run as root!"
@@ -88,47 +94,126 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # Check if drive is mounted and path exists
-if ! mountpoint -q /media/BACKUP; then
+if ! mountpoint -q "/media/BACKUP"; then
   echo "ERROR: BACKUP is not mounted!"
   exit 1
 fi
-
-
-if [ ! -d "$mediadir" ]; then
-  echo "ERROR: $mediadir does not exist!"
+if [ ! -d "$BACKUP_DIR" ]; then
+  echo "ERROR: $BACKUP_DIR does not exist!"
   exit 1
 fi
 
-# Get information
+##### Get information
+echo "Collecting information. Warning this will take a while!"
+echo
 echo "Backup Information:"
-FREE=$(df -k --output=avail "$mediadir" | tail -n1)  # in KiB
-FREE=$((FREE*1024))  # in B
-MEDIAFILESIZE=$(sudo -u ethan rsync -e 'ssh -i /home/ethan/.ssh/id_ed25519_nopass' -an --stats --exclude="lost+found" ethan@rpiserver.pihole:/media/ethan/MediaContent | awk '/Total file size/ {print $4}' | tr -d ',')  # in B
-EXISTINGFILES=$(du -bsc "$mediadir" | tail -n1 | cut -f1)  # in B
-MEDIAFILESIZE=$((MEDIAFILESIZE - EXISTINGFILES))
-MARGIN=$(toBytes 50 G)  # 100GiB in B
-REMAINING=$((FREE - MEDIAFILESIZE - MARGIN))
 
+# backup dir stats
+FREE=$(toBytes "$(df -k --output=avail "$BACKUP_DIR" | tail -n1)" "K")
+EXISTINGFILES=$(du -bsc -- "$BACKUP_DIR" | tail -n1 | cut -f1)  # in B
 echo
-echo "MediaBackup Free Space Before Backup: $(humanSize "$FREE")"
+echo "Free Space Before Backup: $(humanSize "$FREE")"
 echo
-echo "New Media Files to Copy:              $(humanSize "$MEDIAFILESIZE")"
-echo "Backup Size Margin:                   $(humanSize "$MARGIN")"
+echo "Space Used Before Backup: $(humanSize "$EXISTINGFILES")"
+
+# backup file sizes
 echo
-echo "MediaBackup Free Space After Backup:  $(humanSize "$REMAINING")"
+echo "Backup file size:"
+
+# boot size
+BOOT_SIZE=$(toBytes "$(df -k --output=used "$BOOT_DIR" | tail -n1)" "K")
+(( TOTAL_SIZE += BOOT_SIZE ))
+echo "  Boot: $(humanSize "$BOOT_SIZE")"
+
+# rsync size
+for i in "${!RSYNC_BACKUP_TARGETS[@]}"; do
+  target="${RSYNC_BACKUP_TARGETS[$i]}"
+  declare -n SOURCES="RSYNC_SOURCES_$i"
+  declare -n SIZES_N="RSYNC_SIZES_$i"
+
+  total=0
+  for j in "${!SOURCES[@]}"; do
+    source="${SOURCES[$j]}"
+    size=$(du -bsc -- "$source" | tail -n1 | cut -f1)  # in B
+    SIZES_N[j]=$size
+    (( total += size ))
+  done
+
+  RSYNC_SIZES[i]=$total
+  (( TOTAL_SIZE += total ))
+  echo "  $target: $(humanSize "$total")"
+done
+
+# get btrfs snapshots and sizes
+for i in "${!BTRFS_TARGETS[@]}"; do
+  target="${BTRFS_TARGETS[$i]}"
+  subvol="${BTRFS_SUBVOLS[$i]}"
+  snapperConfig="${BTRFS_SNAPPER_CONFIG[$i]}"
+  [[ "$subvol" == "/" ]] || subvol="${subvol}/"
+
+  snapshot="$(snapper -c "$snapperConfig" --csv ls -t single --disable-used-space | grep timeline | sort -t',' -k6,6 | less | tail -n 1 | cut -d',' -f3)"
+  # size="$(btrfs filesystem du -s --raw "${subvol}.snapshots/$snapshot/snapshot" | awk 'NR==2 {print $1}')"
+
+  BTRFS_SNAPSHOTS[i]="$snapshot"
+  BTRFS_SIZES[i]=$size
+  (( TOTAL_SIZE += size ))
+  echo "  $target: $(humanSize "$size")  (snapshot: $snapshot)"
+done
+
+# total backup size
+MARGIN=$(toBytes 50 G)  # 50GiB in B
+(( TOTAL_SIZE += MARGIN ))
+echo "  Margin: $(humanSize "$MARGIN")"
+echo
+echo "Total Backup Size: $(humanSize "$TOTAL_SIZE")"
+
+# remaining
+REMAINING=$((FREE - TOTAL_SIZE))
+echo
+echo "Free Space After Backup:  $(humanSize "$REMAINING")"
 echo
 
-if [[ $REMAINING -lt 0 ]]; then
-  echo "ERROR: Not enough free space!"
-  echo "Clean up some backups and try again..."
+####### Loop and check for enough free space remaining
+# check if it is impossible to get enough free space
+TOTAL_BACKUPDIR_SPACE=$((FREE + EXISTINGFILES))
+if [[ $TOTAL_BACKUPDIR_SPACE -lt $TOTAL_SIZE ]]; then
+  echo "ERROR: it is not possible to get enough free space!"
   exit 1
 fi
 
-read -r -n 1 -p "Contiue? [y/N]" continue
+read -r -n 1 -p "Continue? [y/N]" continue
 echo
 if [[ ! "$continue" =~ ^[Yy]$ ]]; then
-  exit 1
+  exit 2
 fi
+
+until [[ $REMAINING -gt 0 ]]; do
+  echo "Not enough free space!"
+  IFS= read -r -d $'\0' line < <(find "$BACKUP_DIR" -type d -maxdepth 1 -mindepth 1 -printf '%T@ %p\0' 2>/dev/null | sort -z -n)
+  file="${line#* }"
+  filesize=$(du -bsc -- "$file" | tail -n1 | cut -f1)  # in B
+
+  read -r -n 1 -p "Remove $(basename "$file") to free up $(humanSize "$filesize")? [y/N]" continue
+  echo
+  if [[ ! "$continue" =~ ^[Yy]$ ]]; then
+    exit 2
+  fi
+
+  # Delete oldest backup
+  rm -rfI "$file"
+  (( REMAINING += filesize ))
+done
+
+
+######## Backup
+echo
+echo "Backing up data"
+echo
+echo "$BOOT_TARGET:"
+
+exit 0
+
+
 
 # Backup
 echo "Starting Backup..."
