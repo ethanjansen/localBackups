@@ -180,7 +180,7 @@ for i in "${!BTRFS_TARGETS[@]}"; do
   snapperConfig="${BTRFS_SNAPPER_CONFIG[$i]}"
   [[ "$subvol" == "/" ]] || subvol="${subvol}/"
 
-  snapshot="$(snapper -c "$snapperConfig" --csv ls -t single --disable-used-space | grep timeline | sort -t',' -k6,6 | less | tail -n 1 | cut -d',' -f3)"
+  snapshot="$(snapper -c "$snapperConfig" --csv ls -t single --disable-used-space | grep timeline | sort -t',' -k6,6 | tail -n 1 | cut -d',' -f3)"
   size="$(btrfs filesystem du -s --raw "${subvol}.snapshots/$snapshot/snapshot" | awk 'NR==2 {print $1}')"
 
   BTRFS_SNAPSHOTS[i]="$snapshot"
@@ -233,7 +233,7 @@ until [[ $REMAINING -gt 0 ]]; do
   fi
 
   # Delete oldest backup
-  rm -rfI "$file"
+  rm -rf "$file"
   (( REMAINING += filesize ))
 done
 
@@ -299,7 +299,6 @@ for i in "${!BTRFS_TARGETS[@]}"; do
   echo
   echo "$target:"
   btrfs send --proto 2 "${subvol}.snapshots/$snapshot/snapshot" | pv -s "$size" | xz -9e -T 0 --memory=90% > "$BACKUP_DIR/$DATE/$target.btrfs.xz"
-  break
 done
 echo "  Done."
 
