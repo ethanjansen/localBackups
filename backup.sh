@@ -19,11 +19,11 @@ BOOT_DIR="/boot"
 BOOT_DEV="/dev/nvme0n1p1"
 BOOT_SIZE= # in bytes
 
-# Rsync backup - array of arrays
-RSYNC_BACKUP_TARGETS=("Games") # First will be copied to $BACKUP_DIR/$RSYNC_BACKUP_TARGETS[], then backed up to $BACKUP_DIR/$RSYNC_BACKUP_TARGETS[].tar.xz
-RSYNC_SOURCES_0=("/mnt/games/cloneHero" "/mnt/games/links" "/mnt/games/mods")
-RSYNC_SIZES=() # in bytes - parallel to RSYNC_BACKUP_TARGETS[]
-RSYNC_SIZES_0=() # in bytes - parallel to RSYNC_SOURCES_0[]
+# Tar backup - array of arrays
+TAR_BACKUP_TARGETS=("Games") # First will be copied to $BACKUP_DIR/$TAR_BACKUP_TARGETS[], then backed up to $BACKUP_DIR/$TAR_BACKUP_TARGETS[].tar.xz
+TAR_SOURCES_0=("/mnt/games/cloneHero" "/mnt/games/links" "/mnt/games/mods")
+TAR_SIZES=() # in bytes - parallel to TAR_BACKUP_TARGETS[]
+TAR_SIZES_0=() # in bytes - parallel to TAR_SOURCES_0[]
 
 # BTRFS backup - parallel arrays
 BTRFS_TARGETS=("Root" "Home" "VMs" "Data" "GameBackups") # will backup to $BTRFS_TARGETS.btrfs.xz
@@ -85,6 +85,16 @@ humanSize() {
   printf "%s%.2f %s\n" "$sign" "$bytes" "${units[$i]}"
 }
 
+FIXEDMOUNT=true
+fixBootMount() {
+  if ! $FIXEDMOUNT; then
+    echo "Remounting $BOOT_DIR as read-write"
+    mount -o remount "$BOOT_DIR"
+    FIXEDMOUNT=true
+  fi
+  return 0
+}
+
 ############# MAIN #################
 
 # Check if root
@@ -93,7 +103,10 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Check if drive is mounted and path exists
+# Make sure boot is mounted properly
+trap fixBootMount EXIT
+
+# Check if drive is mounted and path exists, make sure Date does not already exist
 if ! mountpoint -q "/media/BACKUP"; then
   echo "ERROR: BACKUP is not mounted!"
   exit 1
@@ -102,6 +115,22 @@ if [ ! -d "$BACKUP_DIR" ]; then
   echo "ERROR: $BACKUP_DIR does not exist!"
   exit 1
 fi
+if [ -d "$BACKUP_DIR/$DATE" ]; then
+  echo "ERROR: $BACKUP_DIR/$DATE already exists!"
+  exit 1
+fi
+
+# Unmount $BOOT_DIR
+bootinusecount=$(lsof +f -- "$BOOT_DIR" 2>/dev/null | tail -n +2 | wc -l)
+if [[ "$bootinusecount" -gt 0 ]]; then
+  echo "ERROR: Unable to unmount $BOOT_DIR It is currently in use!"
+  lsof +f -- "$BOOT_DIR" 2>/dev/null
+  exit 1
+fi
+echo "Mounting $BOOT_DIR as read-only until a backup is taken of it"
+echo
+FIXEDMOUNT=false
+mount -o remount,ro "$BOOT_DIR"
 
 ##### Get information
 echo "Collecting information. Warning this will take a while!"
@@ -121,15 +150,15 @@ echo
 echo "Backup file size:"
 
 # boot size
-BOOT_SIZE=$(toBytes "$(df -k --output=used "$BOOT_DIR" | tail -n1)" "K")
+BOOT_SIZE=$(toBytes "$(df -k --output=size "$BOOT_DIR" | tail -n1)" "K")
 (( TOTAL_SIZE += BOOT_SIZE ))
 echo "  Boot: $(humanSize "$BOOT_SIZE")"
 
-# rsync size
-for i in "${!RSYNC_BACKUP_TARGETS[@]}"; do
-  target="${RSYNC_BACKUP_TARGETS[$i]}"
-  declare -n SOURCES="RSYNC_SOURCES_$i"
-  declare -n SIZES_N="RSYNC_SIZES_$i"
+# tar size
+for i in "${!TAR_BACKUP_TARGETS[@]}"; do
+  target="${TAR_BACKUP_TARGETS[$i]}"
+  declare -n SOURCES="TAR_SOURCES_$i"
+  declare -n SIZES_N="TAR_SIZES_$i"
 
   total=0
   for j in "${!SOURCES[@]}"; do
@@ -139,7 +168,7 @@ for i in "${!RSYNC_BACKUP_TARGETS[@]}"; do
     (( total += size ))
   done
 
-  RSYNC_SIZES[i]=$total
+  TAR_SIZES[i]=$total
   (( TOTAL_SIZE += total ))
   echo "  $target: $(humanSize "$total")"
 done
@@ -152,7 +181,7 @@ for i in "${!BTRFS_TARGETS[@]}"; do
   [[ "$subvol" == "/" ]] || subvol="${subvol}/"
 
   snapshot="$(snapper -c "$snapperConfig" --csv ls -t single --disable-used-space | grep timeline | sort -t',' -k6,6 | less | tail -n 1 | cut -d',' -f3)"
-  # size="$(btrfs filesystem du -s --raw "${subvol}.snapshots/$snapshot/snapshot" | awk 'NR==2 {print $1}')"
+  size="$(btrfs filesystem du -s --raw "${subvol}.snapshots/$snapshot/snapshot" | awk 'NR==2 {print $1}')"
 
   BTRFS_SNAPSHOTS[i]="$snapshot"
   BTRFS_SIZES[i]=$size
@@ -181,18 +210,22 @@ if [[ $TOTAL_BACKUPDIR_SPACE -lt $TOTAL_SIZE ]]; then
   exit 1
 fi
 
+# General continue prompt
 read -r -n 1 -p "Continue? [y/N]" continue
 echo
 if [[ ! "$continue" =~ ^[Yy]$ ]]; then
   exit 2
 fi
 
+# Iterate through, deleting old backups if necessary
 until [[ $REMAINING -gt 0 ]]; do
   echo "Not enough free space!"
+  # always gets oldest file. requires deletion to iterate
   IFS= read -r -d $'\0' line < <(find "$BACKUP_DIR" -type d -maxdepth 1 -mindepth 1 -printf '%T@ %p\0' 2>/dev/null | sort -z -n)
   file="${line#* }"
   filesize=$(du -bsc -- "$file" | tail -n1 | cut -f1)  # in B
 
+  # confirm file deletion
   read -r -n 1 -p "Remove $(basename "$file") to free up $(humanSize "$filesize")? [y/N]" continue
   echo
   if [[ ! "$continue" =~ ^[Yy]$ ]]; then
@@ -206,125 +239,70 @@ done
 
 
 ######## Backup
+mkdir "$BACKUP_DIR/$DATE"
 echo
-echo "Backing up data"
+echo "Backing up data to $DATE"
+
+# Info
+echo
+echo "Info:"
+touch "$BACKUP_DIR/$DATE/Info.txt"
+{
+echo "##################### Disk and Partition Information #####################"
+for i in "${!DISKS[@]}"; do
+  fdisk -l "${DISKS[$i]}"
+  echo
+done
+echo "##################### fstab #####################"
+cat /etc/fstab
+echo
+echo "##################### BTRFS Filesystems #####################"
+for i in "${!BTRFS_FILESYSTEMS_ALL[@]}"; do
+  btrfs filesystem show "${BTRFS_FILESYSTEMS_ALL[$i]}"
+  echo
+done
+echo "##################### BTRFS Subvolumes #####################"
+for i in "${!BTRFS_SUBVOLS_ALL[@]}"; do
+  btrfs subvolume show "${BTRFS_SUBVOLS_ALL[$i]}" | grep -v "snapshot"
+  echo
+done
+} >> "$BACKUP_DIR/$DATE/Info.txt"
+echo "  Done."
+
+# Boot
 echo
 echo "$BOOT_TARGET:"
+dd if="$BOOT_DEV" status=none | pv -s "$BOOT_SIZE" | xz -9e -T 0 --memory=90% > "$BACKUP_DIR/$DATE/$BOOT_TARGET.dd.xz"
+echo -n "  Done: "
+fixBootMount
 
-exit 0
+# Tar
+for i in "${!TAR_BACKUP_TARGETS[@]}"; do
+  target="${TAR_BACKUP_TARGETS[$i]}"
+  size="${TAR_SIZES[$i]}"
+  declare -n SOURCES="TAR_SOURCES_$i"
 
-
-
-# Backup
-echo "Starting Backup..."
-pushd "$mediadir" || (echo "ERROR: cannout pushd"; exit 1)
-rm -fv "Plex Media Server.tar.xz"
-
-echo "Creating Metadata Backup on Server..."
-sudo -u ethan ssh -i /home/ethan/.ssh/id_ed25519_nopass ethan@rpiserver.pihole "sudo /home/ethan/PlexServerBackup.sh"
-
-echo "Backing up Media Files..."
-sudo -u ethan rsync -e 'ssh -i /home/ethan/.ssh/id_ed25519_nopass' -rltDvP --delete --size-only --exclude="lost+found" ethan@rpiserver.pihole:/media/ethan/MediaContent/ "$mediadir"/
-sudo -u ethan ssh -i /home/ethan/.ssh/id_ed25519_nopass ethan@rpiserver.pihole "rm -fv /media/ethan/MediaContent/Plex\ Media\ Server.tar.xz"
-
-popd || exit 1
-read -rp Done
-
-#!/bin/bash
-echo updating
-sudo apt-get update
-sudo apt-get upgrade -y
-
-echo mounting drives
-sudo mount /dev/disk/by-partlabel/BACKUP /media/ethan/BACKUP
-sudo mount /dev/nvme1n1p4 /media/ethan/C
-sudo mount /dev/sda1 /media/ethan/D
-sudo mount /dev/nvme1n1p5 /media/ethan/E
-sudo mount /dev/nvme0n1p1 /media/ethan/F
-
-echo displaying information
-(xterm -hold -e "htop" &> /dev/null &)
-(xterm -hold -e "watch -n 300 ls -sh /media/ethan/BACKUP/Backup/`date +"%Y-%m-%d"`/" &> /dev/null &)
-
-dir="/media/ethan/BACKUP/Backup/"
-mediadir="/media/ethan/BACKUP/MediaBackup"
-C="/media/ethan/C"
-D="/media/ethan/D"
-E="/media/ethan/E"
-F="/media/ethan/F"
-cd "$dir"
-
-d="$(date +"%Y-%m-%d")"
-mkdir "$d"
-
-echo checking file sizes
-FREE=`df -k --output=avail "$dir" | tail -n1`
-MEDIAFILES=`du -sc "$mediadir" | tail -n1 | cut -f1`
-FILES0=`runuser -l ethan -c 'rsync -a -n --stats --exclude="lost+found" ethan@192.168.1.15:/media/ethan/MediaContent' | grep "Total file size:" | cut -c 18-34 | tr -d ','`
-FILES1=`df -k --output=used "$C" | tail -n1`
-FILES2=`df -k --output=used "$F" | tail -n1`
-FILES3=`du -sc "$C"/Users/ethan "$D"/Data "$D"/GameBackups "$E"/Lego\ Star\ Wars\ The\ Complete\ Saga "$E"/Linked "$E"/Minecraft "$E"/PvZ  | tail -n1 | cut -f1`
-FILES4=$(($FILES0/1024 + $FILES1 + $FILES2 + $FILES3 - $MEDIAFILES + 524288000))
-until [[ $FREE -gt $FILES4 ]]; do
-        echo less than $FILES4 free
-        IFS= read -r -d $'\0' line < <(find "$dir" -type d -maxdepth 1 -mindepth 1 -printf '%T@ %p\0' 2>/dev/null | sort -z -n)
-        file="${line#* }"
-        ls -lLd "$file"
-        rm -rfI "$file"
-	FREE=`df -k --output=avail "$dir" | tail -n1`
+  echo
+  echo "$target:"
+  tar -cf - "${SOURCES[@]}" 2>/dev/null | pv -s "$size" | xz -9e -T 0 --memory=90% > "$BACKUP_DIR/$DATE/$target.tar.xz"
 done
-echo more than $FILES4 free
-echo continuing
+echo "  Done."
 
-cd "$d"
-echo full C backup
-sudo umount "$C"
-sudo dd if=/dev/nvme1n1p4 status=progress | xz -9e -T 0 --memory=90% > ./CBackup.dd.xz
-sudo mount /dev/nvme1n1p4 "$C"
+# BTRFS
+for i in "${!BTRFS_TARGETS[@]}"; do
+  target="${BTRFS_TARGETS[$i]}"
+  subvol="${BTRFS_SUBVOLS[$i]}"
+  snapshot="${BTRFS_SNAPSHOTS[$i]}"
+  size="${BTRFS_SIZES[$i]}"
+  [[ "$subvol" == "/" ]] || subvol="${subvol}/"
 
-echo full EFI backup
-sudo dd if=/dev/nvme1n1p1 status=progress | xz -9e -T 0 --memory=90% > ./EFIBackup.dd.xz
+  echo
+  echo "$target:"
+  btrfs send --proto 2 "${subvol}.snapshots/$snapshot/snapshot" | pv -s "$size" | xz -9e -T 0 --memory=90% > "$BACKUP_DIR/$DATE/$target.btrfs.xz"
+  break
+done
+echo "  Done."
 
-(xterm -hold -e "du -sh '/media/ethan/C/Users/ethan' '/media/ethan/D/Data' '/media/ethan/D/GameBackups' '/media/ethan/F' '/media/ethan/E/Lego Star Wars The Complete Saga' '/media/ethan/E/Linked' '/media/ethan/E/Minecraft' '/media/ethan/E/PvZ'" &> /dev/null &)
-(xterm -hold -e "runuser -l ethan -c 'rsync -ahn --size-only --stats --exclude="lost+found" ethan@192.168.1.15:/media/ethan/MediaContent/ /media/ethan/BACKUP/MediaBackup/' | grep 'Total transferred file size:'" &> /dev/null &)
+echo
+read -rp "Backup Done!"
 
-echo Users
-mkdir Users
-rsync -avP "$C"/Users/ethan ./Users/
-tar -I "xz -9e -T 0 --memory=90%" -cpvf Users.tar.xz Users
-rm -rfv Users
-
-echo Data
-rsync -avP "$D"/Data ./Data
-tar -I "xz -9e -T 0 --memory=90%" -cpvf Data.tar.xz Data
-rm -rfv Data
-
-echo Games
-mkdir Games
-rsync -avP "$D"/GameBackups ./Games/
-rsync -avP "$E"/Lego\ Star\ Wars\ The\ Complete\ Saga ./Games/
-rsync -avP "$E"/Linked ./Games/
-rsync -avP "$E"/Minecraft ./Games/
-rsync -avP "$E"/PvZ ./Games/
-tar -I "xz -9e -T 0 --memory=90%" -cpvf Games.tar.xz Games
-rm -rfv Games
-
-echo VirtualMachines
-rsync -avP --exclude="\$RECYCLE.BIN" --exclude="System Volume Information" "$F"/* ./VirtualMachines
-tar -I "xz -9e -T 0 --memory=90%" -cpvf VirtualMachines.tar.xz VirtualMachines
-rm -rfv VirtualMachines
-
-echo MediaContent
-cd "$mediadir"
-rm -fv "Plex Media Server.tar.xz"
-runuser -l ethan -c 'ssh ethan@192.168.1.15 "sudo /home/ethan/PlexServerBackup.sh"'
-echo Making sure disk is still mounted -- USB issue
-mount /dev/disk/by-partlabel/BACKUP /media/ethan/BACKUP
-runuser -l ethan -c "rsync -rltDvP --delete --size-only --exclude="lost+found" ethan@192.168.1.15:/media/ethan/MediaContent/ "$mediadir"/"
-runuser -l ethan -c 'ssh ethan@192.168.1.15 "rm -fv /media/ethan/MediaContent/Plex\ Media\ Server.tar.xz"'
-
-read -p finished
-
-sudo killall xterm
-sleep 10
-sudo umount /media/ethan/*
