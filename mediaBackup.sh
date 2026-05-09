@@ -95,7 +95,7 @@ if [[ $REMAINING -lt 0 ]]; then
   exit 1
 fi
 
-read -r -n 1 -p "Contiue? [y/N]" continue
+read -r -n 1 -p "Continue? [y/N]" continue
 echo
 if [[ ! "$continue" =~ ^[Yy]$ ]]; then
   exit 1
